@@ -7,7 +7,53 @@ import type { PublicProblem } from "@/lib/problems";
 import type { Lang, Round, RunResult, TranscriptEntry } from "@/lib/types";
 import { Avatar, type AvatarState } from "./Avatar";
 import { CodePanel } from "./CodePanel";
-import { englishVoices, Listener, pickVoice, Speaker, speechRecognitionSupported, takeSentences } from "./speech";
+import {
+  englishVoices,
+  isEcho,
+  Listener,
+  pickLocalVoice,
+  pickVoice,
+  soundsLikeQuestion,
+  soundsUnfinished,
+  Speaker,
+  speechRecognitionSupported,
+  takeSentences,
+} from "./speech";
+
+/**
+ * Reads a fast-changing value (mic or voice level) from a ref a few times a second,
+ * so only the small component using it redraws instead of the whole call screen.
+ */
+function usePolled(ref: React.RefObject<number>, ms = 100, steps = 10) {
+  const [v, setV] = useState(0);
+  useEffect(() => {
+    const t = setInterval(() => setV(Math.round((ref.current ?? 0) * steps) / steps), ms);
+    return () => clearInterval(t);
+  }, [ref, ms, steps]);
+  return v;
+}
+
+function LiveAvatar({ persona, state, levelRef }: { persona: Persona; state: AvatarState; levelRef: React.RefObject<number> }) {
+  const level = usePolled(levelRef, 90, 8);
+  return <Avatar persona={persona} state={state} level={state === "speaking" ? level : 0} />;
+}
+
+function MicBar({ levelRef }: { levelRef: React.RefObject<number> }) {
+  const level = usePolled(levelRef);
+  return <span className="block h-full rounded-full bg-teal transition-[width]" style={{ width: `${Math.round(level * 100)}%` }} />;
+}
+
+/** Teal ring around your video while you're talking, like a video call. */
+function SpeakingRing({ levelRef, active }: { levelRef: React.RefObject<number>; active: boolean }) {
+  const level = usePolled(levelRef);
+  if (!active || level <= 0.15) return null;
+  return (
+    <span
+      className="pointer-events-none absolute inset-0 rounded-2xl"
+      style={{ boxShadow: `inset 0 0 0 ${2 + level * 4}px rgba(94,196,182,0.75)` }}
+    />
+  );
+}
 
 interface RoomData {
   id: string;
@@ -30,7 +76,13 @@ interface RoomData {
 type Phase = "loading" | "lobby" | "thinking" | "speaking" | "listening" | "ending" | "error";
 
 const TOKENS = /\[\[(SHOW_PROBLEM|LISTEN|END|ERROR|RATE_LIMIT)\]\]/g;
-const SILENCE_MS = { talk: 1900, coding: 3200 };
+/**
+ * How long a pause means "I've finished", in ms. Longer after "and…", "so um…".
+ * While coding, thinking aloud is gathered up and sent only when the candidate asks
+ * something, pauses for a while, or has been talking for a long stretch.
+ */
+const PAUSE = { done: 2200, unfinished: 3800, codingQuestion: 2200, coding: 6000, codingLongTalk: 2500 };
+const LONG_TALK_MS = 40_000;
 
 function speakable(full: string, final: boolean) {
   let s = full.replace(TOKENS, "");
@@ -52,7 +104,6 @@ export function Room({ id }: { id: string }) {
   const [phase, setPhase] = useState<Phase>("loading");
   const [caption, setCaption] = useState<string | null>(null);
   const [heard, setHeard] = useState("");
-  const [level, setLevel] = useState(0);
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
   const [problemShown, setProblemShown] = useState(false);
   const [runResult, setRunResult] = useState<RunResult | null>(null);
@@ -67,8 +118,9 @@ export function Room({ id }: { id: string }) {
   const [voiceName, setVoiceName] = useState("");
   const [typed, setTyped] = useState("");
   const [confirmEnd, setConfirmEnd] = useState(false);
-  const [micLevel, setMicLevel] = useState(0);
   const [sttOk, setSttOk] = useState(true);
+  const micLevel = useRef(0);
+  const voiceLevel = useRef(0);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const mediaRef = useRef<MediaStream | null>(null);
@@ -83,6 +135,15 @@ export function Room({ id }: { id: string }) {
   const lastInterviewerEnd = useRef(0);
   const busy = useRef(false);
   const queuedSaid = useRef<string | null>(null);
+  /** Cancels the in-flight turn if the candidate keeps talking before the reply starts. */
+  const turnAbort = useRef<AbortController | null>(null);
+  /** When the current stretch of candidate speech began (for long think-aloud). */
+  const speechStart = useRef(0);
+  /** What the interviewer said recently, to recognise its echo through speakers. */
+  const echoText = useRef("");
+  const echoUntil = useRef(0);
+  /** Set when the candidate talks over the interviewer: the rest of that reply is dropped. */
+  const interrupted = useRef(false);
   const nudged = useRef(false);
   const timeUpSent = useRef(false);
   const ending = useRef(false);
@@ -159,7 +220,7 @@ export function Room({ id }: { id: string }) {
         analyser.getByteTimeDomainData(buf);
         let sum = 0;
         for (const b of buf) sum += (b - 128) ** 2;
-        setMicLevel(Math.min(1, Math.sqrt(sum / buf.length) / 30));
+        micLevel.current = Math.min(1, Math.sqrt(sum / buf.length) / 30);
         requestAnimationFrame(tick);
       };
       tick();
@@ -199,18 +260,22 @@ export function Room({ id }: { id: string }) {
   useEffect(() => stopEverything, [stopEverything]);
 
   // ------------------------------------------------------------- listening
+  // The mic stays on for the whole call, so nothing you say is lost, even while
+  // the interviewer is talking. Buffers are only cleared when they're sent.
   const startListening = useCallback(() => {
-    finalBuf.current = "";
-    interimBuf.current = "";
-    setHeard("");
     lastActivity.current = Date.now();
     nudged.current = false;
     if (!mutedRef.current) listenerRef.current?.start();
     setPhaseBoth("listening");
   }, [setPhaseBoth]);
 
-  const stopListening = useCallback(() => {
-    listenerRef.current?.stop();
+  const takeBuffer = useCallback(() => {
+    const said = `${finalBuf.current} ${interimBuf.current}`.replace(/\s+/g, " ").trim();
+    finalBuf.current = "";
+    interimBuf.current = "";
+    speechStart.current = 0;
+    setHeard("");
+    return said;
   }, []);
 
   // ------------------------------------------------------------- one turn
@@ -224,9 +289,7 @@ export function Room({ id }: { id: string }) {
         return;
       }
       busy.current = true;
-      stopListening();
       setPhaseBoth("thinking");
-      setHeard("");
       const at = Math.round((Date.now() - clockStart.current) / 1000);
       if (body.said) {
         setTranscript((t) => [...t, { role: "candidate", text: body.said!, at, whileCoding: problemShownRef.current || undefined }]);
@@ -234,7 +297,10 @@ export function Room({ id }: { id: string }) {
 
       let full = "";
       let queuedUpTo = 0;
+      let cancelled = false;
       const speaker = speakerRef.current!;
+      echoText.current = "";
+      interrupted.current = false;
       const flush = (final: boolean) => {
         if (full.includes("[[SHOW_PROBLEM]]") && !problemShownRef.current) {
           problemShownRef.current = true;
@@ -242,9 +308,18 @@ export function Room({ id }: { id: string }) {
         }
         const clean = speakable(full, final);
         const pending = clean.slice(queuedUpTo);
-        const { sentences, rest } = final ? { sentences: [pending], rest: "" } : takeSentences(pending);
+        let { sentences, rest } = final ? { sentences: [pending], rest: "" } : takeSentences(pending);
+        // Start talking at a natural pause in a long first sentence rather than waiting for its end.
+        if (!final && !sentences.length && queuedUpTo === 0 && rest.length > 90) {
+          const comma = rest.lastIndexOf(", ");
+          if (comma > 40) {
+            sentences = [rest.slice(0, comma + 1)];
+            rest = rest.slice(comma + 2);
+          }
+        }
         for (const s of sentences) {
-          if (s.trim()) {
+          if (s.trim() && !interrupted.current) {
+            echoText.current += ` ${s}`;
             speaker.say(s);
             setPhaseBoth("speaking");
           }
@@ -252,15 +327,24 @@ export function Room({ id }: { id: string }) {
         queuedUpTo = clean.length - rest.length;
       };
 
+      const abort = new AbortController();
+      turnAbort.current = abort;
       try {
-        const res = await fetch(`/api/interviews/${id}/turn`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ ...body, code: data?.round === "technical" ? codeRef.current : undefined }),
-        });
-        if (!res.ok || !res.body) {
-          const err = await res.json().catch(() => ({ error: "The interviewer couldn't respond." }));
-          throw new Error(err.error);
+        let res: Response | null = null;
+        // The server may still be closing a turn that was just cancelled; wait briefly.
+        for (let attempt = 0; attempt < 12; attempt++) {
+          res = await fetch(`/api/interviews/${id}/turn`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ ...body, code: data?.round === "technical" ? codeRef.current : undefined }),
+            signal: abort.signal,
+          });
+          if (res.status !== 429) break;
+          await new Promise((r) => setTimeout(r, 350));
+        }
+        if (!res || !res.ok || !res.body) {
+          const err = await res?.json().catch(() => null);
+          throw new Error(err?.error ?? "The interviewer couldn't respond.");
         }
         const reader = res.body.getReader();
         const dec = new TextDecoder();
@@ -274,22 +358,25 @@ export function Room({ id }: { id: string }) {
         if (full.includes("[[RATE_LIMIT]]")) {
           setNotice("The free AI limit was reached for the moment. Wait about a minute, then keep talking; nothing you said is lost.");
         } else if (full.includes("[[ERROR]]")) {
-          setNotice("The interviewer's connection dropped for a moment. Keep going; what you said will reach them with your next answer.");
+          setNotice("The interviewer couldn't answer just now. Keep going; what you said will reach them with your next answer.");
         } else {
           setNotice(null);
         }
       } catch (err) {
-        setNotice(err instanceof Error ? err.message : "Connection problem. Please try again.");
+        if (abort.signal.aborted) cancelled = true;
+        else setNotice(err instanceof Error && err.message !== "Failed to fetch" ? err.message : "Couldn't reach the server. Check that it's still running.");
       }
+      turnAbort.current = null;
 
-      const spoken = speakable(full, true).trim();
+      const spoken = cancelled ? "" : speakable(full, true).trim();
       if (spoken) {
         setTranscript((t) => [...t, { role: "interviewer", text: spoken, at: Math.round((Date.now() - clockStart.current) / 1000) }]);
       }
       await speaker.idle();
       lastInterviewerEnd.current = Date.now();
+      echoUntil.current = Date.now() + 2500; // speaker echo can trail the end a little
       busy.current = false;
-      if (full.includes("[[END]]")) {
+      if (full.includes("[[END]]") && !cancelled) {
         finishRef.current();
         return;
       }
@@ -301,16 +388,37 @@ export function Room({ id }: { id: string }) {
         sendTurn({ said });
       }
     },
-    [id, data?.round, setPhaseBoth, startListening, stopListening],
+    [id, data?.round, setPhaseBoth, startListening],
   );
 
   const submitSpeech = useCallback(() => {
-    const said = `${finalBuf.current} ${interimBuf.current}`.replace(/\s+/g, " ").trim();
-    finalBuf.current = "";
-    interimBuf.current = "";
-    setHeard("");
+    const said = takeBuffer();
     if (said) sendTurn({ said });
-  }, [sendTurn]);
+  }, [sendTurn, takeBuffer]);
+
+  /**
+   * The candidate is speaking while the interviewer is busy. Before the reply has
+   * started, cancel it so the candidate can finish; while it's being spoken, stop
+   * talking — unless what the mic hears is just the interviewer's own echo.
+   */
+  const onCandidateSpeech = useCallback((text: string, final: boolean) => {
+    const p = phaseRef.current;
+    const echoWindow = p === "speaking" || Date.now() < echoUntil.current;
+    if (echoWindow && isEcho(text, echoText.current)) return false;
+    const words = text.trim().split(/\s+/).filter(Boolean).length;
+    if (p === "thinking" && turnAbort.current && words >= 2) {
+      turnAbort.current.abort();
+    } else if (p === "speaking" && (final ? words >= 2 : words >= 3)) {
+      interrupted.current = true;
+      speakerRef.current?.cancel();
+    }
+    return true;
+  }, []);
+
+  const interrupt = useCallback(() => {
+    interrupted.current = true;
+    speakerRef.current?.cancel();
+  }, []);
 
   // ------------------------------------------------------------- finish
   const finish = useCallback(async () => {
@@ -335,8 +443,14 @@ export function Room({ id }: { id: string }) {
     if (!data) return;
     const speaker = new Speaker();
     speaker.voice = voices.find((v) => v.name === voiceName) ?? null;
+    const local = pickLocalVoice(voices, data.persona.gender);
+    if (local && speaker.voice && !speaker.voice.localService) speaker.fallbackVoice = local;
+    speaker.onVoiceSwitch = (v) => {
+      setVoiceName(v.name);
+      setNotice(`The online voice kept stalling, so the interviewer switched to "${v.name}".`);
+    };
     speaker.onSentence = setCaption;
-    speaker.onLevel = setLevel;
+    speaker.onLevel = (l) => (voiceLevel.current = l);
     speakerRef.current = speaker;
     // Unlock speech synthesis inside this click.
     window.speechSynthesis.cancel();
@@ -344,15 +458,21 @@ export function Room({ id }: { id: string }) {
 
     listenerRef.current = new Listener({
       onFinal: (t) => {
+        if (!onCandidateSpeech(t, true)) return;
         finalBuf.current = `${finalBuf.current} ${t}`.trim();
+        interimBuf.current = "";
+        speechStart.current ||= Date.now();
+        lastActivity.current = Date.now();
         setHeard(finalBuf.current);
       },
       onInterim: (t) => {
+        if (!t || !onCandidateSpeech(t, false)) return;
         interimBuf.current = t;
+        speechStart.current ||= Date.now();
+        lastActivity.current = Date.now();
         setHeard(`${finalBuf.current} ${t}`.trim());
       },
       onActivity: () => {
-        lastActivity.current = Date.now();
         nudged.current = false;
       },
       onError: (kind, message) => {
@@ -360,6 +480,7 @@ export function Room({ id }: { id: string }) {
         setNotice(message);
       },
     });
+    if (!mutedRef.current) listenerRef.current.start();
 
     clockStart.current = Date.now() - data.elapsed * 1000;
     sendTurn({
@@ -367,7 +488,7 @@ export function Room({ id }: { id: string }) {
         ? "The candidate reconnected to the call after a drop. Briefly acknowledge it and continue where you left off."
         : `The candidate has joined the call${mediaRef.current && camOn ? " with their camera on" : ""}.`,
     });
-  }, [data, voices, voiceName, sendTurn, camOn]);
+  }, [data, voices, voiceName, sendTurn, camOn, onCandidateSpeech]);
 
   // ------------------------------------------------------------- timers
   useEffect(() => {
@@ -375,7 +496,7 @@ export function Room({ id }: { id: string }) {
     const t = setInterval(() => {
       const now = Date.now();
       const el = (now - clockStart.current) / 1000;
-      setElapsed(el);
+      setElapsed(Math.floor(el)); // redraws once a second, not four times
       const limit = durationRef.current * 60;
       if (el > limit + 360) {
         finishRef.current();
@@ -383,10 +504,16 @@ export function Room({ id }: { id: string }) {
       }
       if (phaseRef.current !== "listening" || busy.current) return;
 
-      // End of a spoken answer: a pause after some speech.
-      const hasSpeech = Boolean(finalBuf.current || interimBuf.current);
-      const threshold = problemShownRef.current ? SILENCE_MS.coding : SILENCE_MS.talk;
-      if (hasSpeech && now - lastActivity.current > threshold) {
+      // End of a spoken answer: a long enough pause after some speech.
+      const text = `${finalBuf.current} ${interimBuf.current}`.trim();
+      const hasSpeech = Boolean(text);
+      const silent = now - lastActivity.current;
+      let wait = soundsUnfinished(text) ? PAUSE.unfinished : PAUSE.done;
+      if (problemShownRef.current) {
+        const longTalk = speechStart.current && now - speechStart.current > LONG_TALK_MS;
+        wait = soundsLikeQuestion(text) ? Math.max(wait, PAUSE.codingQuestion) : longTalk ? PAUSE.codingLongTalk : PAUSE.coding;
+      }
+      if (hasSpeech && silent > wait) {
         submitSpeech();
         return;
       }
@@ -435,9 +562,7 @@ export function Room({ id }: { id: string }) {
         setRunResult(r);
         if (kind === "submit" && !busy.current) {
           // Pending speech is folded into the same turn.
-          const said = `${finalBuf.current} ${interimBuf.current}`.replace(/\s+/g, " ").trim();
-          finalBuf.current = "";
-          interimBuf.current = "";
+          const said = takeBuffer();
           sendTurn({ event: "The candidate submitted their code; the results are above.", said: said || undefined });
         }
       } catch (err) {
@@ -446,7 +571,7 @@ export function Room({ id }: { id: string }) {
         setRunning(null);
       }
     },
-    [id, sendTurn],
+    [id, sendTurn, takeBuffer],
   );
 
   // ------------------------------------------------------------- render
@@ -464,10 +589,8 @@ export function Room({ id }: { id: string }) {
   const remaining = data.durationMin * 60 - elapsed;
 
   const selfTile = (small: boolean) => (
-    <div
-      className={`relative overflow-hidden rounded-2xl bg-ink-800 ${small ? "aspect-[4/3]" : "aspect-[4/3]"}`}
-      style={{ boxShadow: micLevel > 0.15 && phase === "listening" && !muted ? `0 0 0 ${2 + micLevel * 4}px rgba(94,196,182,0.7)` : undefined }}
-    >
+    <div className={`relative overflow-hidden rounded-2xl bg-ink-800 ${small ? "aspect-[4/3]" : "aspect-[4/3]"}`}>
+      <SpeakingRing levelRef={micLevel} active={!muted && phase !== "lobby"} />
       <video ref={videoRef} autoPlay muted playsInline className={`h-full w-full -scale-x-100 object-cover ${camOn && !camError ? "" : "invisible"}`} />
       {(!camOn || camError) && (
         <div className="absolute inset-0 grid place-items-center">
@@ -488,7 +611,7 @@ export function Room({ id }: { id: string }) {
           <div className="mt-3 flex items-center gap-3 text-sm text-paper-dim">
             <span>Mic</span>
             <span className="h-2 flex-1 rounded-full bg-white/[0.07]">
-              <span className="block h-full rounded-full bg-teal transition-[width]" style={{ width: `${Math.round(micLevel * 100)}%` }} />
+              <MicBar levelRef={micLevel} />
             </span>
             <button className="text-amber" onClick={() => setCamOn((c) => !c)}>
               {camOn ? "Turn camera off" : "Turn camera on"}
@@ -571,7 +694,7 @@ export function Room({ id }: { id: string }) {
   const interviewerTile = (
     <div className="relative overflow-hidden rounded-2xl bg-ink-800">
       <div className={problemShown ? "aspect-[4/3]" : "aspect-video"}>
-        <Avatar persona={persona} state={avatarState} level={level} />
+        <LiveAvatar persona={persona} state={avatarState} levelRef={voiceLevel} />
       </div>
       <span className="absolute left-3 top-3 rounded-md bg-black/55 px-2 py-0.5 text-xs">
         {persona.name} · {persona.title}
@@ -691,10 +814,8 @@ export function Room({ id }: { id: string }) {
             mutedRef.current = m;
             if (m) {
               listenerRef.current?.stop();
-              finalBuf.current = "";
-              interimBuf.current = "";
-              setHeard("");
-            } else if (phaseRef.current === "listening") listenerRef.current?.start();
+              takeBuffer();
+            } else if (phaseRef.current !== "ending") listenerRef.current?.start();
           }}
           aria-pressed={muted}
         >
@@ -704,7 +825,7 @@ export function Room({ id }: { id: string }) {
           {camOn ? "Camera off" : "Camera on"}
         </button>
         {phase === "speaking" && (
-          <button className="btn btn-ghost !px-4 !py-2" onClick={() => speakerRef.current?.cancel()}>
+          <button className="btn btn-ghost !px-4 !py-2" onClick={interrupt}>
             Interrupt
           </button>
         )}
@@ -720,9 +841,8 @@ export function Room({ id }: { id: string }) {
             const t = typed.trim();
             if (!t || phase === "ending") return;
             setTyped("");
-            const pending = `${finalBuf.current} ${interimBuf.current}`.replace(/\s+/g, " ").trim();
-            finalBuf.current = "";
-            interimBuf.current = "";
+            const pending = takeBuffer();
+            if (phaseRef.current === "speaking") interrupt();
             sendTurn({ said: pending ? `${pending} ${t}` : t });
           }}
         >

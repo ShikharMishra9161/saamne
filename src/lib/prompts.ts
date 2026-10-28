@@ -54,7 +54,7 @@ export function interviewerSystem(iv: Interview, user: User, problem?: Problem):
       .join("\n");
     return `${header}
 
-The candidate codes in ${LANG_LABEL[iv.language!]} in a shared editor that you can see; each message includes the latest code when it changed. The editor can run the examples ("Run") or the full hidden test suite including performance tests ("Submit"); you are told the results. Difficulty: ${iv.difficulty}.
+The candidate codes in ${LANG_LABEL[iv.language!]} in a shared editor that you can see; each message includes the latest code when it changed. You can only read the editor: you cannot type, edit or run anything, so never offer to or claim you did. If the candidate has trouble with the editor, suggest refreshing the page (their work and the interview are kept); meanwhile let them talk through the solution aloud. The editor can run the examples ("Run") or the full hidden test suite including performance tests ("Submit"); you are told the results. Difficulty: ${iv.difficulty}.
 
 The problem you will give: "${problem.title}"
 ${problem.statement}

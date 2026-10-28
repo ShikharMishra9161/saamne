@@ -85,6 +85,9 @@ export function CodePanel({
             onMount={mount}
             theme="vs-dark"
             options={{
+              // Monaco's newer EditContext input drops some keystrokes in Chrome
+              // (letters went missing while typing); the classic textarea input is reliable.
+              editContext: false,
               fontSize: 14,
               fontFamily: "var(--font-jetbrains), monospace",
               minimap: { enabled: false },

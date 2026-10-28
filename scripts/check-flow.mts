@@ -20,3 +20,14 @@ const out = await generateJson({
   thinking: "low",
 });
 console.log(`json ${Date.now() - t1} ms:`, JSON.stringify(out));
+
+// Cancelling a turn (the candidate kept talking) must stop it cleanly.
+const ac = new AbortController();
+setTimeout(() => ac.abort(), 150);
+const t2 = Date.now();
+try {
+  await streamTurn({ system, history, input: "<said>Tell me a long story.</said>", thinking: "low", onText: () => {}, signal: ac.signal });
+  console.log("cancel: NOT cancelled");
+} catch (e) {
+  console.log(`cancel: ${(e as Error).constructor.name} after ${Date.now() - t2} ms`);
+}

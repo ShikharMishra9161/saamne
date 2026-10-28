@@ -14,9 +14,23 @@ export { hasApiKey };
  * Streams the interviewer's reply to `input`, continuing the stored conversation.
  * Returns the new interaction id to continue from next time.
  */
-export function interviewerTurn(iv: Interview, input: string, onText: (delta: string) => void) {
+const EDITOR = /<editor>[\s\S]*?<\/editor>/g;
+
+export function interviewerTurn(iv: Interview, input: string, onText: (delta: string) => void, signal?: AbortSignal) {
+  // Only the newest code snapshot matters; older ones just slow every turn down.
+  const turns = [...(iv.aiLog ?? []), { role: "user" as const, text: input }];
+  let latest = -1;
+  turns.forEach((t, i) => {
+    if (t.role === "user" && EDITOR.test(t.text)) latest = i;
+    EDITOR.lastIndex = 0;
+  });
+  const compact = turns.map((t, i) =>
+    t.role === "user" && i !== latest ? { ...t, text: t.text.replace(EDITOR, "<editor>(older version, see the latest below)</editor>") } : t,
+  );
+  const history = compact.slice(0, -1);
+  const current = compact[compact.length - 1].text;
   // Low thinking keeps the reply fast enough for a spoken conversation.
-  return streamTurn({ system: iv.systemPrompt, history: iv.aiLog ?? [], input, thinking: "low", onText });
+  return streamTurn({ system: iv.systemPrompt, history, input: current, thinking: "low", onText, signal });
 }
 
 // ------------------------------------------------------------------ report

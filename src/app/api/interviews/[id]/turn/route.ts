@@ -2,7 +2,7 @@ import { interviewerTurn } from "@/lib/ai";
 import { handle, HttpError, requireUser } from "@/lib/auth";
 import { updateInterview } from "@/lib/db";
 import { elapsedSec, mmss, ownInterview } from "@/lib/interviews";
-import { RateLimitError } from "@/lib/llm";
+import { AbortedError, RateLimitError } from "@/lib/llm";
 
 export const maxDuration = 120;
 
@@ -60,10 +60,25 @@ export const POST = handle(async (req: Request, ctx: RouteContext<"/api/intervie
   }
 
   const encoder = new TextEncoder();
+  // The browser cancels the request when the candidate carries on talking before
+  // the reply starts; the turn is then dropped and its input folded into the next.
+  const cancel = new AbortController();
+  req.signal.addEventListener("abort", () => cancel.abort());
+  const send = (controller: ReadableStreamDefaultController<Uint8Array>, s: string) => {
+    try {
+      controller.enqueue(encoder.encode(s));
+    } catch {
+      // client already gone
+    }
+  };
   const stream = new ReadableStream<Uint8Array>({
+    cancel() {
+      cancel.abort();
+    },
     async start(controller) {
       try {
-        const { text } = await interviewerTurn(iv, input, (d) => controller.enqueue(encoder.encode(d)));
+        const { text } = await interviewerTurn(iv, input, (d) => send(controller, d), cancel.signal);
+        if (cancel.signal.aborted) throw new AbortedError("cancelled");
         updateInterview(id, (x) => {
           x.aiLog = [...(x.aiLog ?? []), { role: "user", text: input }, { role: "model", text: text || "[[LISTEN]]" }];
           const spoken = text.replace(TOKENS, "").trim();
@@ -73,13 +88,19 @@ export const POST = handle(async (req: Request, ctx: RouteContext<"/api/intervie
           }
         });
       } catch (err) {
-        console.error("Interviewer turn failed", err);
         // Keep what the candidate said so the interviewer still hears it next turn.
         updateInterview(id, (x) => void (x.aiUnsent = [...(x.aiUnsent ?? []), input]));
-        controller.enqueue(encoder.encode(err instanceof RateLimitError ? "[[RATE_LIMIT]]" : "[[ERROR]]"));
+        if (!(err instanceof AbortedError)) {
+          console.error("Interviewer turn failed", err);
+          send(controller, err instanceof RateLimitError ? "[[RATE_LIMIT]]" : "[[ERROR]]");
+        }
       } finally {
         locks.delete(id);
-        controller.close();
+        try {
+          controller.close();
+        } catch {
+          // client already gone
+        }
       }
     },
   });

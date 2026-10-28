@@ -44,10 +44,12 @@ Requirements for the coding round: `javac`/`java`, `python`, `g++` and `node` on
 ```
 npm run test:problems   # every reference answer agrees with an independent brute force
 npm run test:runner     # every starter template compiles in all 4 languages; correct code passes, brute force fails perf
+npx tsx scripts/check-speech.mts                       # echo filter and pause detection
+npx tsx --env-file=.env.local scripts/check-flow.mts  # live Gemini: turns, memory, cancelling, JSON
 ```
 
 ## Settings
 
-- `GEMINI_LIVE_MODEL` (default `gemini-3.5-flash-lite`, first words in ~1.2 s) for the conversation, `GEMINI_MODEL` (default `gemini-3.8-flash`) for reports and resumes. If a model is busy the app switches to the other one automatically. Your free limits: https://aistudio.google.com/rate-limit.
+- Models: the conversation races the free Gemini models (`gemini-3.5-flash-lite`, `gemini-3.1-flash-lite`, `gemini-3.6-flash`, `gemini-3.8-flash`): the first is asked at once, the next joins if no answer has started within 2.5 s, and the first to answer wins. Reports prefer `gemini-3.8-flash`. Override the first choice with `GEMINI_LIVE_MODEL` / `GEMINI_MODEL`. Your free limits: https://aistudio.google.com/rate-limit.
 - `FREE_INTERVIEWS` (default 5): interviews each new account starts with. Calls too short to score are refunded.
 - The code runner executes code on this machine. That's fine for personal use; before letting other people use it, run code in a container or sandbox service.
